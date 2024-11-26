@@ -47,18 +47,30 @@ class SinusoidalPositionEmbeddings(nn.Module):
       self.dim = dim
 
     def forward(self, time: torch.Tensor) -> torch.Tensor:
-        # TODO: compute the sinusoidal positional encoding of the time
+        """
+        Compute sinusoidal positional embeddings for diffusion timesteps.
+        Args:
+            time (torch.Tensor): Tensor of timesteps (batch_size,).
+        Returns:
+            torch.Tensor: Sinusoidal positional embeddings (batch_size, dim).
+        """
         device = time.device
-
-        embeddings = ...
-
+        half_dim = self.dim // 2    # split
+        # Scaling factors based on the formula
+        div_term = torch.exp(-torch.arange(half_dim, device=device) * (2 * torch.log(torch.tensor(10000.0)) / self.dim))
+        # Compute sine and cosine embeddings
+        embeddings = torch.cat([
+            torch.sin(time[:, None] * div_term),
+            torch.cos(time[:, None] * div_term)
+        ], dim=-1)
         return embeddings
 
 
+
 class UNet(nn.Module):
-    def __init__(self, in_channels: int=1, 
-                 down_channels: List=[64, 128, 128, 128, 128], 
-                 up_channels: List=[128, 128, 128, 128, 64], 
+    def __init__(self, in_channels: int=1,
+                 down_channels: List=[64, 128, 128, 128, 128],
+                 up_channels: List=[128, 128, 128, 128, 64],
                  time_emb_dim: int=128,
                  num_classes: int=10) -> None:
         super().__init__()
@@ -67,23 +79,74 @@ class UNet(nn.Module):
 
         self.num_classes = num_classes
 
-        # TODO: time embedding layer
-        self.time_mlp = ...
+        # Time embedding layer
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.GELU(),
+            nn.Linear(time_emb_dim, time_emb_dim)
+        )
 
-        # TODO: define the embedding layer to compute embeddings for the labels
-        self.class_emb = ...
+        # Label embedding layer
+        self.class_emb = nn.Embedding(num_classes, time_emb_dim)
 
-        # define your network architecture here
+        # Downsampling layers
+        self.downs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels if i == 0 else down_channels[i - 1], down_channels[i], kernel_size=3, padding=1),
+                nn.BatchNorm2d(down_channels[i]),
+                nn.ReLU()
+            )
+            for i in range(len(down_channels))
+        ])
+
+        # Bottleneck layer
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(down_channels[-1], down_channels[-1], kernel_size=3, padding=1),
+            nn.BatchNorm2d(down_channels[-1]),
+            nn.ReLU()
+        )
+
+        # Upsampling layers
+        self.ups = nn.ModuleList([
+            nn.Sequential(
+                nn.ConvTranspose2d(down_channels[-1]*2 if i == 0 else up_channels[i - 1] + down_channels[-(i + 1)],
+                                   up_channels[i],
+                                   kernel_size=3,
+                                   padding=1),
+                nn.BatchNorm2d(up_channels[i]),
+                nn.ReLU()
+            )
+            for i in range(len(up_channels))
+        ])
+
+        # Final layer
+        self.final_conv = nn.Conv2d(up_channels[-1], in_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
-        # TODO: embed time
-        t = ...
+        # Embed time and labels
+        t = self.time_mlp(timestep)  # Time embeddings
+        l = self.class_emb(label) if self.num_classes > 0 else 0  # Label embeddings
 
-        # TODO: handle label embeddings if labels are avaialble
-        l = ...
-        
-        # TODO: compute the output of your network
-        out = ...
+        # Combine embeddings into a conditioning vector
+        conditioning = t + l  # Broadcast addition
+
+        # Pass through downsampling layers
+        downs = []
+        for down in self.downs:
+            x = down(x)
+            downs.append(x)
+
+        # Pass through bottleneck layer
+        x = self.bottleneck(x)
+
+        # Pass through upsampling layers with skip connections
+        for i, up in enumerate(self.ups):
+            skip = downs[-(i + 1)]
+            x = up(torch.cat([x, skip], dim=1))  # Concatenate along channel dimension
+
+        # Final layer to reconstruct the input space
+        out = self.final_conv(x)
 
         return out
 
