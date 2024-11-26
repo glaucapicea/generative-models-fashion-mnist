@@ -11,31 +11,32 @@ from typing import Tuple
 
 
 class VarianceScheduler:
-    def __init__(self, beta_start: int=0.0001, beta_end: int=0.02, num_steps: int=1000, interpolation: str='linear') -> None:
+    def __init__(self, beta_start: float=0.0001, beta_end: float=0.02, num_steps: int=1000, interpolation: str='linear') -> None:
         self.num_steps = num_steps
 
-        # find the beta valuess by linearly interpolating from start beta to end beta
+        # Interpolate beta values, result is an evenly spaced set of values from beta_start to beta_end
         if interpolation == 'linear':
-            # TODO: complete the linear interpolation of betas here
-            self.betas = ...
+            self.betas = torch.linspace(beta_start, beta_end, num_steps)
         elif interpolation == 'quadratic':
-            # TODO: complete the quadratic interpolation of betas here
-            self.betas = ...
+            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_steps) ** 2 # Normalize the vector of betas
         else:
             raise Exception('[!] Error: invalid beta interpolation encountered...')
-        
 
-        # TODO: add other statistics such alphas alpha_bars and all the other things you might need here
-        ...
+        # Precompute statistics
+        self.alphas = 1 - self.betas
+        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
 
     def add_noise(self, x:torch.Tensor, time_step:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         device = x.device
 
-        # TODO: sample a random noise
-        noise = ...
+        # Extract alpha_bar[t] for each time step in the batch
+        alpha_bars_t = self.alpha_bars[time_step].to(device).view(-1, 1, 1, 1)
 
-        # TODO: construct the noisy sample
-        noisy_input = ...
+        # Sample random noise
+        noise = torch.randn_like(x, device=device)
+
+        # Compute noisy image
+        noisy_input = torch.sqrt(alpha_bars_t) * x + torch.sqrt(1 - alpha_bars_t) * noise
 
         return noisy_input, noise
 
