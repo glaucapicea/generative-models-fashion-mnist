@@ -473,10 +473,10 @@ class DDPM(nn.Module):
     def generate_sample(self, num_samples: int, device: torch.device = torch.device('cuda'),
                         labels: torch.Tensor = None):
         '''
-
-        :param num_samples:
-        :param device:
-        :param labels:
+        Iteratively generate samples from pure noise
+        :param num_samples: Number of samples to generate
+        :param device:      Device
+        :param labels:      Labels for which the sample are to be generated for
         :return:
         '''
         shape = (num_samples, 1, 32, 32)  # Example image shape (n_samples, in_channels, H, W)
