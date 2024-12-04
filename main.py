@@ -75,7 +75,7 @@ if __name__ == '__main__':
     if mode == 'train':
         os.makedirs('checkpoints', exist_ok=True)
         # training configs
-        epochs = 150
+        epochs = 50
         batch_size = 128
         eval_intervals = 10
         num_generated_samples = 5
@@ -96,7 +96,7 @@ if __name__ == '__main__':
             model.load_state_dict(torch.load(f'checkpoints/{model_type.upper()}.pt'))
         else:
             raise FileNotFoundError(f'[!] ERROR: Weight file for {model_type.upper()} does not exist! Try training the model first.')
-        
+
         print(f'\n\n\t Generating images using {model_type.upper()} ...')
         with torch.no_grad():
             labels = torch.tensor([i//5 for i in range(50)], dtype=torch.long, device=device)
@@ -118,9 +118,9 @@ if __name__ == '__main__':
             predictions = classifier(samples)
 
             acc, score = calc_acc(predictions, labels)
-        
+
         print(f'\n\n\t Generated images saved!')
         print(f'Accuracy: {acc * 100:.2f}%\t Score: {score:.2f}')
 
 
-    
+

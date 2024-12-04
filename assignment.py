@@ -1,3 +1,5 @@
+assignment.py
+
 import torch
 
 from models import VAE
@@ -20,8 +22,7 @@ def prepare_ddpm() -> DDPM:
 
     # dTODO: efine the confifurations of the UNet
     in_channels = 1
-    down_channels = [64, 128, 128, 128, 128]
-    up_channels = [128, 128, 128, 128, 64]
+    n_downs = 2
     time_embed_dim = 128
     num_classes = 10
 
@@ -29,9 +30,8 @@ def prepare_ddpm() -> DDPM:
     var_scheduler = VarianceScheduler(beta_start=beta1, beta_end=beta2, num_steps=num_steps, interpolation=interpolation)
 
     # TODO: define the noise estimating UNet
-    network = UNet(in_channels=in_channels, 
-                   down_channels=down_channels, 
-                   up_channels=up_channels, 
+    network = UNet(in_channels=in_channels,
+                   n_downs=2,
                    time_emb_dim=time_embed_dim,
                    num_classes=num_classes)
     
@@ -51,8 +51,7 @@ def prepare_ddim() -> DDIM:
 
     # TODO: define the confifurations of the UNet
     in_channels = 1
-    down_channels = [64, 128, 128, 128, 128]
-    up_channels = [128, 128, 128, 128, 64]
+    n_downs = 2
     time_embed_dim = 128
     num_classes = 10
 
@@ -60,9 +59,8 @@ def prepare_ddim() -> DDIM:
     var_scheduler = VarianceScheduler(beta_start=beta1, beta_end=beta2, num_steps=num_steps, interpolation=interpolation)
 
     # TODO: define the noise estimating UNet
-    network = UNet(in_channels=in_channels, 
-                   down_channels=down_channels, 
-                   up_channels=up_channels, 
+    network = UNet(in_channels=in_channels,
+                   n_downs=2,
                    time_emb_dim=time_embed_dim,
                    num_classes=num_classes)
     

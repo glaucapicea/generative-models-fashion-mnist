@@ -1,13 +1,11 @@
 import torch
-import math
+from torch import nn
 
-import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
+from typing import List, Tuple
 
-from typing import List
-from typing import Tuple
 
+# from labml_nn.diffusion.ddpm.utils import gather
 
 class VarianceScheduler:
     def __init__(self, beta_start: float = 0.0001, beta_end: float = 0.02, num_steps: int = 1000,
@@ -26,6 +24,7 @@ class VarianceScheduler:
         # Precompute statistics
         self.alphas = 1 - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
+        self.sigma2 = self.betas
 
     def add_noise(self, x: torch.Tensor, time_step: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         '''
@@ -77,89 +76,187 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 
+class SelfAttention(nn.Module):
+    def __init__(self, channels, size):
+        super(SelfAttention, self).__init__()
+        self.channels = channels
+        self.size = size
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        x = x.view(-1, self.channels, self.size * self.size).swapaxes(1, 2)
+        x_ln = self.ln(x)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = attention_value + x
+        attention_value = self.ff_self(attention_value) + attention_value
+        return attention_value.swapaxes(2, 1).view(-1, self.channels, self.size, self.size)
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None, residual=False):
+        super().__init__()
+        self.residual = residual
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, mid_channels),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, out_channels),
+        )
+
+    def forward(self, x):
+        if self.residual:
+            return F.gelu(x + self.double_conv(x))
+        else:
+            return self.double_conv(x)
+
+
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels, emb_dim=128):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, in_channels, residual=True),
+            DoubleConv(in_channels, out_channels),
+        )
+
+        self.emb_layer = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(
+                emb_dim,
+                out_channels
+            ),
+        )
+
+    def forward(self, x, t):
+        x = self.maxpool_conv(x)
+        emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
+        return x + emb
+
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, emb_dim=128):
+        super().__init__()
+
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv = nn.Sequential(
+            DoubleConv(in_channels, in_channels, residual=True),
+            DoubleConv(in_channels, out_channels, in_channels // 2),
+        )
+
+        self.emb_layer = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(
+                emb_dim,
+                out_channels
+            ),
+        )
+
+    def forward(self, x, skip_x, t):
+        x = self.up(x)
+        x = torch.cat([skip_x, x], dim=1)
+        x = self.conv(x)
+        emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
+        return x + emb
+
+
 class UNet(nn.Module):
     def __init__(self,
                  in_channels: int = 1,
-                 down_channels: List = [64, 128, 128, 128, 128],
-                 up_channels: List = [128, 128, 128, 128, 64],
+                 n_downs=2,
                  time_emb_dim: int = 128,
                  num_classes: int = 10) -> None:
         super().__init__()
 
         # NOTE: You can change the arguments received by the UNet if you want, but keep the num_classes argument
-
         self.num_classes = num_classes
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.time_emb_dim = time_emb_dim
 
-        # Time embedding layer
+        # Label embedding layer
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.GELU(),
             nn.Linear(time_emb_dim, time_emb_dim)
         )
+        self.class_emb = nn.Embedding(num_classes, self.time_emb_dim)
 
-        # Label embedding layer
-        self.class_emb = nn.Embedding(num_classes, time_emb_dim)
+        # Initial input resizing layer
+        self.inc = DoubleConv(in_channels, 32)
 
         # Downsampling layers
-        self.downs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(in_channels if i == 0 else down_channels[i - 1], down_channels[i], kernel_size=3, padding=1),
-                nn.BatchNorm2d(down_channels[i]),
-                nn.ReLU()
-            )
-            for i in range(len(down_channels))
-        ])
+        self.down1 = Down(32, 64)
+        self.sa1 = SelfAttention(64, 16)
+        self.down2 = Down(64, 128)
+        self.sa2 = SelfAttention(128, 8)
+        self.down3 = Down(128, 128)
+        self.sa3 = SelfAttention(128, 4)
 
-        # Bottleneck layer
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(down_channels[-1], down_channels[-1], kernel_size=3, padding=1),
-            nn.BatchNorm2d(down_channels[-1]),
-            nn.ReLU()
-        )
+        # Bottleneck layers
+        self.bot1 = DoubleConv(128, 256)
+        self.bot2 = DoubleConv(256, 256)
+        self.bot3 = DoubleConv(256, 128)
 
         # Upsampling layers
-        self.ups = nn.ModuleList([
-            nn.Sequential(
-                nn.ConvTranspose2d(down_channels[-1] * 2 if i == 0 else up_channels[i - 1] + down_channels[-(i + 1)],
-                                   up_channels[i],
-                                   kernel_size=3,
-                                   padding=1),
-                nn.BatchNorm2d(up_channels[i]),
-                nn.ReLU()
-            )
-            for i in range(len(up_channels))
-        ])
+        self.up1 = Up(256, 64)
+        self.sa4 = SelfAttention(64, 8)
+        self.up2 = Up(128, 32)
+        self.sa5 = SelfAttention(32, 16)
+        self.up3 = Up(64, 32)
+        self.sa6 = SelfAttention(32, 32)
+        self.outc = nn.Conv2d(32, in_channels, kernel_size=1)
 
-        # Final layer
-        self.final_conv = nn.Conv2d(up_channels[-1], in_channels, kernel_size=1)
+    def pos_encoding(self, time):
+        dim = self.time_emb_dim
+        inv_freq = 1.0 / (
+                10000
+                ** (torch.arange(0, dim, 2, device=self.device).float() / dim)
+        )
+        sine_half = torch.sin(time.repeat(1, dim // 2) * inv_freq)
+        cos_half = torch.cos(time.repeat(1, dim // 2) * inv_freq)
+        pos_enc = torch.cat([sine_half, cos_half], dim=-1)
+        return pos_enc
 
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
-        # Embed time and labels
-        t = self.time_mlp(timestep)  # Time embeddings
-        l = self.class_emb(label) if self.num_classes > 0 else 0  # Label embeddings
+        t = self.time_mlp(timestep)
+        # t = SinusoidalPositionEmbeddings(timestep)
+        # t = t.unsqueeze(-1).type(torch.float)
+        # t = self.pos_encoding(t)
+        if label is not None:
+            t += self.class_emb(label)
 
-        # Combine embeddings into a conditioning vector
-        conditioning = t + l  # Broadcast addition
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t)
+        x2 = self.sa1(x2)
+        x3 = self.down2(x2, t)
+        x3 = self.sa2(x3)
+        x4 = self.down3(x3, t)
+        x4 = self.sa3(x4)
 
-        # Pass through downsampling layers
-        downs = []
-        for down in self.downs:
-            x = down(x)
-            downs.append(x)
+        x4 = self.bot1(x4)
+        x4 = self.bot2(x4)
+        x4 = self.bot3(x4)
 
-        # Pass through bottleneck layer
-        x = self.bottleneck(x)
+        x = self.up1(x4, x3, t)
+        x = self.sa4(x)
+        x = self.up2(x, x2, t)
+        x = self.sa5(x)
+        x = self.up3(x, x1, t)
+        x = self.sa6(x)
 
-        # Pass through upsampling layers with skip connections
-        for i, up in enumerate(self.ups):
-            skip = downs[-(i + 1)]
-            x = up(torch.cat([x, skip], dim=1))  # Concatenate along channel dimension
+        output = self.outc(x)
 
-        # Final layer to reconstruct the input space
-        out = self.final_conv(x)
-
-        return out
+        return output
 
 
 class VAE(nn.Module):
@@ -356,11 +453,20 @@ class DDPM(nn.Module):
         # TODO: implement the sample recovery strategy of the DDPM
 
         # Get precomputed alphas and alpha bars
+        betas = self.var_scheduler.betas.to(device)[timestep].view(-1, 1, 1, 1)
         alpha_t = self.var_scheduler.alphas.to(device)[timestep].view(-1, 1, 1, 1)
         alpha_bar_t = self.var_scheduler.alpha_bars.to(device)[timestep].view(-1, 1, 1, 1)
 
+        # eps_coef = (1-alpha_t) / (1 - alpha_bar_t) ** 0.5
+        # mean = 1/(alpha_t ** 0.5) * (noisy_sample - eps_coef * estimated_noise)
+        # var = self.var_scheduler.betas.to(device)[timestep].view(-1, 1, 1, 1)
+        # eps = torch.rand_like(noisy_sample, device=noisy_sample.device)
+        # return mean + (var ** 0.5) * eps
+        noise = torch.randn_like(noisy_sample, device=device) if timestep.max() > 0 else 0.0
         # Calculate x_t-1
-        x_prev = (1 / torch.sqrt(alpha_t)) * (noisy_sample - torch.sqrt(1 - alpha_t) * estimated_noise)
+        x_prev = (1 / torch.sqrt(alpha_t)) * (
+                    noisy_sample - (1 - alpha_t / torch.sqrt(1 - alpha_bar_t)) * estimated_noise) + torch.sqrt(
+            betas) * noise
         return x_prev
 
     @torch.no_grad()
@@ -373,7 +479,7 @@ class DDPM(nn.Module):
         :param labels:
         :return:
         '''
-        shape = (num_samples, self.network.downs[0][0].in_channels, 32, 32)  # Example image shape (adjust accordingly)
+        shape = (num_samples, 1, 32, 32)  # Example image shape (n_samples, in_channels, H, W)
         samples = torch.randn(shape, device=device)  # Start from pure noise
 
         if labels is not None and self.network.num_classes is not None:
@@ -388,6 +494,7 @@ class DDPM(nn.Module):
         for t in reversed(range(self.var_scheduler.num_steps)):
             timestep = torch.tensor([t] * num_samples, device=device)
             estimated_noise = self.network(samples, timestep, labels)
+
             if t > 0:
                 samples = self.recover_sample(samples, estimated_noise, timestep)
             else:
