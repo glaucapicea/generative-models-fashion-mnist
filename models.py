@@ -450,23 +450,16 @@ class DDPM(nn.Module):
         :return: Denoised version of the sample at step t-1 (x_t-1)
         '''
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # TODO: implement the sample recovery strategy of the DDPM
+        # Sample recovery strategy of the DDPM
 
         # Get precomputed alphas and alpha bars
         betas = self.var_scheduler.betas.to(device)[timestep].view(-1, 1, 1, 1)
         alpha_t = self.var_scheduler.alphas.to(device)[timestep].view(-1, 1, 1, 1)
         alpha_bar_t = self.var_scheduler.alpha_bars.to(device)[timestep].view(-1, 1, 1, 1)
-
-        # eps_coef = (1-alpha_t) / (1 - alpha_bar_t) ** 0.5
-        # mean = 1/(alpha_t ** 0.5) * (noisy_sample - eps_coef * estimated_noise)
-        # var = self.var_scheduler.betas.to(device)[timestep].view(-1, 1, 1, 1)
-        # eps = torch.rand_like(noisy_sample, device=noisy_sample.device)
-        # return mean + (var ** 0.5) * eps
         noise = torch.randn_like(noisy_sample, device=device) if timestep.max() > 0 else 0.0
+
         # Calculate x_t-1
-        x_prev = (1 / torch.sqrt(alpha_t)) * (
-                    noisy_sample - (1 - alpha_t / torch.sqrt(1 - alpha_bar_t)) * estimated_noise) + torch.sqrt(
-            betas) * noise
+        x_prev = (1 / torch.sqrt(alpha_t)) * (noisy_sample - ( betas / torch.sqrt(1 - alpha_bar_t) ) * estimated_noise) + torch.sqrt(betas) * noise
         return x_prev
 
     @torch.no_grad()
@@ -490,7 +483,7 @@ class DDPM(nn.Module):
         else:
             labels = None
 
-        # TODO: apply the iterative sample generation of the DDPM
+        # Iterative sample generation of the DDPM
         for t in reversed(range(self.var_scheduler.num_steps)):
             timestep = torch.tensor([t] * num_samples, device=device)
             estimated_noise = self.network(samples, timestep, labels)
@@ -513,31 +506,68 @@ class DDIM(nn.Module):
         self.network = network
 
     def forward(self, x: torch.Tensor, label: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # TODO: uniformly sample as many timesteps as the batch size
-        t = ...
+        # Uniformly sample as many timesteps as the batch size
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        batch_size = x.shape[0]
+        t = torch.randint(low=0,
+                          high=self.var_scheduler.num_steps,
+                          size=(batch_size,),
+                          device=device)
 
-        # TODO: generate the noisy input
-        noisy_input, noise = ...
+        # Generate the noisy input
+        noisy_input, noise = self.var_scheduler.add_noise(x, t)
 
-        # TODO: estimate the noise
-        estimated_noise = ...
+        # Estimate the noise using the UNet
+        estimated_noise = self.network(x=noisy_input,
+                                       timestep=t,
+                                       label=label)
 
-        # TODO: compute the loss
-        loss = F.l1_loss(estimated_noise, noise)
+        # Compute the L2 loss
+        loss = F.mse_loss(estimated_noise, noise)
 
         return loss
 
     @torch.no_grad()
     def recover_sample(self, noisy_sample: torch.Tensor, estimated_noise: torch.Tensor,
                        timestep: torch.Tensor) -> torch.Tensor:
-        # TODO: apply the sample recovery strategy of the DDIM
-        sample = ...
+        '''
+            Recover sample using DDIM sampling strategy.
+            :param noisy_sample: The current sample in the backwards process (x_t)
+            :param estimated_noise: The noise predicted by the UNet (epsilon_theta)
+            :param timestep: The current timestep t
+            :return: Denoised version of the sample at step t-1 (x_t-1)
+            '''
+        device = noisy_sample.device
 
-        return sample
+        # Precomputed statistics
+        alpha_t = self.var_scheduler.alphas.to(device)[timestep].view(-1, 1, 1, 1)
+        alpha_bar_t = self.var_scheduler.alpha_bars.to(device)[timestep].view(-1, 1, 1, 1)
+
+        # For DDIM: Compute x_0 (clean image estimate)
+        pred_x0 = (1 / torch.sqrt(alpha_bar_t)) * (noisy_sample - torch.sqrt(1 - alpha_bar_t) * estimated_noise)
+
+        # Compute alpha_bar for t-1
+        t_next = timestep - 1
+        alpha_bar_t_next = self.var_scheduler.alpha_bars.to(device)[t_next].view(-1, 1, 1, 1)
+
+        # Interpolate x_t-1
+        x_t_next = torch.sqrt(alpha_bar_t_next) * pred_x0 + torch.sqrt(1 - alpha_bar_t_next) * estimated_noise
+
+        return x_t_next
 
     @torch.no_grad()
     def generate_sample(self, num_samples: int, device: torch.device = torch.device('cuda'),
                         labels: torch.Tensor = None):
+        '''
+        Iteratively generate samples from pure noise
+        :param num_samples: Number of samples to generate
+        :param device:      Device
+        :param labels:      Labels for which the sample are to be generated for
+        :return:
+        '''
+        shape = (num_samples, 1, 32, 32)  # Example image shape (n_samples, in_channels, H, W)
+        samples = torch.randn(shape, device=device)  # Start from pure noise
+
         if labels is not None and self.network.num_classes is not None:
             assert len(labels) == num_samples, 'Error: number of labels should be the same as number of samples!'
             labels = labels.to(device)
@@ -545,8 +575,18 @@ class DDIM(nn.Module):
             labels = torch.randint(0, self.network.num_classes, [num_samples, ], device=device)
         else:
             labels = None
-        # TODO: apply the iterative sample generation of DDIM (similar to DDPM)
-        sample = ...
 
-        return sample
+        # Iterative sample generation of the DDPM
+        for t in reversed(range(self.var_scheduler.num_steps)):
+            timestep = torch.tensor([t] * num_samples, device=device)
+            estimated_noise = self.network(samples, timestep, labels)
+
+            if t > 0:
+                samples = self.recover_sample(samples, estimated_noise, timestep)
+            else:
+                # Final denoised sample
+                alpha_bar_t = self.var_scheduler.alpha_bars.to(device)[timestep].view(-1, 1, 1, 1)
+                samples = (1 / torch.sqrt(alpha_bar_t)) * (samples - torch.sqrt(1 - alpha_bar_t) * estimated_noise)
+
+        return samples
 

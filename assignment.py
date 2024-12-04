@@ -1,5 +1,3 @@
-assignment.py
-
 import torch
 
 from models import VAE
